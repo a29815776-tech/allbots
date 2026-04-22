@@ -173,6 +173,16 @@ def init_db():
                     updated_at TIMESTAMP DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS corrections (
+                    id SERIAL PRIMARY KEY,
+                    bot TEXT,
+                    question TEXT,
+                    wrong_answer TEXT,
+                    correction TEXT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
 
 def get_usage(user_id, period):
     with get_db() as conn:
@@ -249,8 +259,23 @@ def call_ai(model, messages):
     return groq_client.chat.completions.create(model=model, messages=messages)
 
 def clean_response(text):
+    text = text.replace('¥', '\\')
     text = re.sub(r'#{1,6}\s*', '', text)
     text = re.sub(r'\*{1,3}(.*?)\*{1,3}', r'\1', text)
+    text = re.sub(r'\\cdot', '×', text)
+    text = re.sub(r'\\times', '×', text)
+    text = re.sub(r'\\begin\{[^}]+\}.*?\\end\{[^}]+\}', '(計算式)', flags=re.DOTALL, string=text)
+    text = re.sub(r'\$+', '', text)
+    for _ in range(8):
+        prev = text
+        text = re.sub(r'\\frac\{([^{}]*)\}\{([^{}]*)\}', r'\1/\2', text)
+        text = re.sub(r'\\sqrt\{([^{}]*)\}', r'√\1', text)
+        text = re.sub(r'\\(?:vec|overrightarrow)\{([^{}]*)\}', r'\1向量', text)
+        text = re.sub(r'\\[a-zA-Z]+\{([^{}]*)\}', r'\1', text)
+        text = re.sub(r'\\[a-zA-Z]+', '', text)
+        text = re.sub(r'\{([^{}]*)\}', r'\1', text)
+        if text == prev:
+            break
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
@@ -267,6 +292,33 @@ def get_quota_period(is_paid, quota_id):
             return datetime.now().strftime("%Y-%m-%d"), FREE_DAILY_QUOTA, f"本月 {MONTHLY_QUOTA} 則訊息已用完，已降回每日 {FREE_DAILY_QUOTA} 則免費版。"
     else:
         return datetime.now().strftime("%Y-%m-%d"), FREE_DAILY_QUOTA, f"今日免費額度（{FREE_DAILY_QUOTA} 則）已用完，明天再來或傳「訂閱」升級進階版。"
+
+CORRECTION_KEYWORDS = ["你錯了", "錯了", "不對", "糾正", "應該是", "正確答案", "錯誤", "不是這樣"]
+
+def is_correction(text):
+    return any(kw in text for kw in CORRECTION_KEYWORDS)
+
+def save_correction(bot, question, wrong_answer, correction):
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO corrections (bot, question, wrong_answer, correction) VALUES (%s, %s, %s, %s)",
+                (bot, question[:500], wrong_answer[:500], correction[:500])
+            )
+
+def get_relevant_corrections(bot, question, limit=3):
+    keywords = [w for w in question.split() if len(w) > 1][:5]
+    if not keywords:
+        return []
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            conditions = " OR ".join(["question ILIKE %s"] * len(keywords))
+            params = [f"%{k}%" for k in keywords] + [bot, limit]
+            cur.execute(
+                f"SELECT question, correction FROM corrections WHERE ({conditions}) AND bot = %s ORDER BY created_at DESC LIMIT %s",
+                params
+            )
+            return cur.fetchall()
 
 def notify_admin(line_api, msg):
     if ADMIN_LINE_ID:
@@ -325,14 +377,38 @@ def handle_text(event, line_api, paid_set, quota_prefix, system_prompt, subscrib
     except Exception:
         history = []
 
+    # 偵測糾正：儲存上一輪的 Q&A + 用戶糾正
+    if is_correction(user_message) and len(history) >= 2:
+        last_user = next((m["content"] for m in reversed(history) if m["role"] == "user"), "")
+        last_bot = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
+        if last_user and last_bot:
+            try:
+                save_correction(quota_prefix, last_user, last_bot, user_message)
+                logger.info(f"[{quota_prefix}] Correction saved for user {user_id}")
+            except Exception as e:
+                logger.error(f"Save correction error: {e}")
+
     history.append({"role": "user", "content": user_message})
     if len(history) > MAX_HISTORY:
         history = history[-MAX_HISTORY:]
 
+    # 查詢相關糾正記錄，加入 system prompt
+    enhanced_prompt = system_prompt
+    try:
+        corrections = get_relevant_corrections(quota_prefix, user_message)
+        if corrections:
+            correction_text = "\n\n以下是過去用戶糾正過的錯誤，請避免重犯：\n"
+            for q, c in corrections:
+                correction_text += f"- 題目：{q}\n  糾正：{c}\n"
+            enhanced_prompt = system_prompt + correction_text
+    except Exception as e:
+        logger.error(f"Get corrections error: {e}")
+
     reply_text = "抱歉，系統暫時無法回應，請稍後再試。"
     try:
-        response = call_ai(TEXT_MODEL, [{"role": "system", "content": system_prompt}] + history)
+        response = call_ai(TEXT_MODEL, [{"role": "system", "content": enhanced_prompt}] + history)
         reply_text = clean_response(response.choices[0].message.content)[:4900]
+        logger.info(f"[{quota_prefix}] Bot reply to {user_id}: {reply_text[:300]}")
         history.append({"role": "assistant", "content": reply_text})
         try:
             save_history(quota_id, history)
